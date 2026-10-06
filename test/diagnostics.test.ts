@@ -4,6 +4,7 @@ import { diagnoseVibration } from '../src/domain/vibration/fuse.ts';
 import { estimateRemainingLife } from '../src/domain/life/estimate.ts';
 import { evaluatePerformance } from '../src/domain/performance/evaluate.ts';
 import { replayTelemetry } from '../src/domain/timeline/replay.ts';
+import { calibrateTelemetry } from '../src/domain/calibration/apply.ts';
 
 test('replay is deterministic and removes duplicate event ids', () => {
   const events = [
@@ -12,6 +13,52 @@ test('replay is deterministic and removes duplicate event ids', () => {
     { runId: 'run-1', eventId: 'b', sampleTimeMs: 2, receivedTimeMs: 4, sequence: 2, sensor: 'rpm', value: 900, unit: 'rpm' },
   ] as any;
   assert.deepEqual(replayTelemetry(events).map((item) => item.eventId), ['a', 'b']);
+});
+
+test('calibration prefers the channel-specific version and uses half-open effective ranges', () => {
+  const baseEvent = { runId: 'run-1', receivedTimeMs: 10, sequence: 0, value: 100, unit: 'rpm' };
+  const events = [
+    { ...baseEvent, eventId: 'a', sampleTimeMs: 100, sensor: 'rpm', channel: 'A' },
+    { ...baseEvent, eventId: 'b', sampleTimeMs: 200, sensor: 'rpm', channel: 'A' },
+    { ...baseEvent, eventId: 'c', sampleTimeMs: 200, sensor: 'rpm', channel: 'B' },
+  ] as any;
+  const calibrations = [
+    { sensor: 'rpm', version: 'generic-v1', effectiveFromMs: 0, effectiveToMs: 200, scale: 1, offset: 0, uncertainty: 1 },
+    { sensor: 'rpm', version: 'generic-v2', effectiveFromMs: 200, scale: 1, offset: 0, uncertainty: 1 },
+    { sensor: 'rpm', channel: 'A', version: 'channel-v1', effectiveFromMs: 0, effectiveToMs: 100, scale: 1, offset: 0, uncertainty: 1 },
+    { sensor: 'rpm', channel: 'A', version: 'channel-v2', effectiveFromMs: 100, scale: 2, offset: 0, uncertainty: 1 },
+  ] as any;
+
+  assert.deepEqual(calibrateTelemetry(events, calibrations).map((sample) => [sample.eventId, sample.calibrationVersion]), [
+    ['a', 'channel-v2'],
+    ['b', 'channel-v2'],
+    ['c', 'generic-v2'],
+  ]);
+});
+
+test('calibration reports missing and overlapping effective ranges as domain errors', () => {
+  const event = { runId: 'run-1', eventId: 'a', sampleTimeMs: 300, receivedTimeMs: 10, sequence: 0, sensor: 'rpm', value: 1, unit: 'rpm' } as any;
+  assert.throws(() => calibrateTelemetry([event], [{ sensor: 'rpm', version: 'v1', effectiveFromMs: 0, effectiveToMs: 200, scale: 1, offset: 0, uncertainty: 1 }]), (error: any) => error.code === 'CALIBRATION_MISSING');
+  assert.throws(() => calibrateTelemetry([event], [
+    { sensor: 'rpm', version: 'v1', effectiveFromMs: 0, effectiveToMs: 300, scale: 1, offset: 0, uncertainty: 1 },
+    { sensor: 'rpm', version: 'v2', effectiveFromMs: 200, scale: 1, offset: 0, uncertainty: 1 },
+  ]), (error: any) => error.code === 'CALIBRATION_OVERLAP');
+});
+
+test('calibration temperature compensation uses the measured value and combines uncertainty in quadrature', () => {
+  const event = { runId: 'run-1', eventId: 'a', sampleTimeMs: 0, receivedTimeMs: 10, sequence: 0, sensor: 'oil-temperature', value: 323.15, unit: 'K' } as any;
+  const [sample] = calibrateTelemetry([event], [{
+    sensor: 'oil-temperature',
+    version: 'temp-v1',
+    effectiveFromMs: 0,
+    scale: 1,
+    offset: 0,
+    temperatureCoefficient: 0.5,
+    referenceTemperatureC: 30,
+    uncertainty: 4,
+  }]);
+  assert.equal(sample.calibratedValue, 323.15 + 10);
+  assert.equal(sample.uncertainty, Math.hypot(4, 323.15 * 0.001));
 });
 
 test('performance produces physical normalized indicators', () => {
